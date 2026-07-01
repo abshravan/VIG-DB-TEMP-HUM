@@ -1,0 +1,343 @@
+# Industrial Server Room Monitoring System — Architecture
+
+**Status:** Design approved for implementation, module-by-module.
+**Scope:** Basement server room monitored via Siemens S7-1200 PLC → Raspberry Pi → local dashboard, LAN-only, internet-optional for historical sync.
+
+This document is the single source of truth for architectural decisions. Every module built afterward must conform to what's described here. If a decision needs to change during implementation, this file gets updated first.
+
+---
+
+## 1. Guiding Constraints (why the design looks the way it does)
+
+1. **LAN-only, offline-first.** The Pi must fully function — polling, alarms, dashboard, storage — with zero internet. Internet is an optional *enhancement* (Atlas sync), never a dependency. This rules out any architecture that requires a cloud round-trip for core function (no cloud-hosted broker, no SaaS auth, no CDN-loaded frontend assets).
+2. **Single Raspberry Pi, constrained resources.** Typically a Pi 4 (4GB) or Pi 5. CPU/RAM/SD-card I/O are the scarce resources, not developer convenience. Every choice below is filtered through "does this run comfortably on a Pi 24/7 for years."
+3. **One site, one Pi.** This is not a multi-tenant, multi-Pi fleet product (yet). That means we can make simplifying choices (single-process backend, SQLite, no message broker) that would be wrong at fleet scale — and we design the seams (repository pattern, DB-agnostic ORM, abstracted PLC client) so it can grow later without a rewrite.
+4. **Safety-relevant data.** Smoke, water leak, door, PLC-offline are not "nice to have" metrics — they gate a physical alarm workflow. The architecture treats digital safety signals with faster polling, debounce logic, and a state machine, not just as another chart series.
+5. **PLC protocol is not finalized.** The PLC team may deliver either S7 or Modbus TCP. The architecture must not hard-code one — a `PLCClient` abstraction (Strategy pattern) with two interchangeable implementations means we don't block on their decision.
+
+---
+
+## 2. High-Level Architecture
+
+```
+┌─────────────────────────┐
+│   Siemens S7-1200 PLC   │  (temperature, humidity, smoke, water leak, door — via DB or Modbus regs)
+└────────────┬─────────────┘
+             │ Ethernet (LAN), S7 protocol (port 102) OR Modbus TCP (port 502)
+             ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                       Raspberry Pi (Docker Compose)                │
+│                                                                     │
+│  ┌───────────────────────────── backend container ──────────────┐ │
+│  │                                                                │ │
+│  │   PLC Client (snap7 / pymodbus, behind common interface)       │ │
+│  │        │  raw values                                           │ │
+│  │        ▼                                                       │ │
+│  │   Poller Worker (asyncio task, tiered polling)                 │ │
+│  │        │  scaled engineering values + timestamps                │ │
+│  │        ▼                                                       │ │
+│  │   Validation Layer (range/rate/staleness checks, quality flag) │ │
+│  │        │                                                       │ │
+│  │        ├──────────────► Alarm Engine (rule eval, state machine)│ │
+│  │        ▼                                                       │ │
+│  │   Repository Layer  ──────────────►  SQLite (WAL mode)         │ │
+│  │        │                                                       │ │
+│  │        ▼                                                       │ │
+│  │   FastAPI (REST /api/v1/*, JWT auth)                           │ │
+│  │        │                                                       │ │
+│  │        ▼                                                       │ │
+│  │   WebSocket Broadcaster (/ws/live) ◄── Alarm Engine events     │ │
+│  │                                                                │ │
+│  │   Background workers: backup, rollup/retention, Atlas sync     │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                          │ REST + WS (proxied)                       │
+│  ┌────────────────────── frontend container (nginx) ──────────────┐│
+│  │   React + Vite static build — Dashboard/History/Events/Settings ││
+│  └──────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────┘
+             │ (only when internet is available, best-effort, async)
+             ▼
+     MongoDB Atlas (optional historical mirror — never a dependency)
+```
+
+Data flow, restated as the pipeline requested:
+
+```
+PLC → PLC Client → Poller (tiered) → Validation Layer → Repository → SQLite
+                                             │
+                                             ▼
+                                       Alarm Engine
+                                             │
+                              ┌──────────────┴──────────────┐
+                              ▼                              ▼
+                        REST API (pull)              WebSocket (push)
+                                             │
+                                             ▼
+                                     React Dashboard
+```
+
+---
+
+## 3. Technology Decisions & Rationale
+
+### 3.1 PLC protocol: S7 (python-snap7) vs Modbus TCP (pymodbus)
+
+| | S7 protocol (`python-snap7`) | Modbus TCP (`pymodbus`) |
+|---|---|---|
+| PLC-side effort | None beyond exposing a DB — but **must disable "Optimized block access"** on that DB (Properties → Attributes), otherwise byte offsets aren't stable and snap7 can't read it. Must also enable "Permit access with PUT/GET communication" under Protection & Security. | PLC team must add an `MB_SERVER` instruction (TIA Portal, firmware ≥ V4.1) and explicitly map each tag to a Modbus register. More PLC engineering work, but works with optimized DBs since the instruction — not raw memory offsets — does the mapping. |
+| Client complexity | Read raw bytes at DB offsets, unpack with `snap7.util` (REAL/INT/BOOL). Requires a tag map (DB#, offset, type) from the PLC team. | Read holding/coil registers by address. Slightly more "standard" (works identically against any brand of PLC, not just Siemens). |
+| Failure mode if PLC team's DB layout changes | Byte offsets shift silently → wrong values unless DB is re-optimized-off and offsets re-confirmed. | Register map is explicit and versioned in the PLC program; less fragile to unrelated DB edits. |
+| Best fit here | **Recommended default** — client explicitly said "preferred if simpler," and it is: no extra ladder/SCL logic needed on their side, just one flag flipped on an existing DB. | Good fallback if the PLC team prefers not to touch DB optimization settings, or if they're more comfortable exposing Modbus (common in mixed-vendor sites). |
+
+**Decision:** Build a `PLCClient` abstract interface (`connect()`, `disconnect()`, `read_all_tags()`, `is_connected()`) with two implementations — `S7PLCClient` and `ModbusPLCClient` — selected by a single config value (`PLC_PROTOCOL=s7|modbus`). Default to S7/snap7. This means the PLC team's final protocol choice is a config change, not a rewrite. Tag mapping (DB/register, data type, scaling, poll tier) lives in `config/plc_tags.yaml`, not in code — the PLC team hands us the map, we don't hand-edit Python for every point.
+
+### 3.2 Database: SQLite now, PostgreSQL-ready later
+
+SQLite because: zero extra process on a resource-constrained Pi, single file for trivial backup, WAL mode gives good concurrent read/write for this write-light (~1 reading/few seconds/sensor) workload. PostgreSQL would be overkill for one site and adds a container + RAM overhead for no real benefit at this scale.
+
+To make swapping to Postgres later a config change, not a rewrite:
+- SQLAlchemy 2.0 async ORM (`aiosqlite` driver now, `asyncpg` later) — no raw SQL, no SQLite-only functions.
+- Alembic migrations written against the ORM models, which are dialect-agnostic (`Integer`, `Float`, `String`, `DateTime`, `Boolean`, `Enum` — no `JSON1`, no `ROWID` tricks).
+- Repository pattern isolates all query code from the rest of the app — if a Postgres-only optimization is ever wanted, it's contained to the repository implementation.
+- Avoid SQLite-specific concurrency assumptions in application logic (e.g., don't rely on single-writer behavior).
+
+### 3.3 Frontend: React + Vite (not Next.js)
+
+Next.js's main advantages — SSR, SEO, edge rendering — are irrelevant for an authenticated, LAN-only, internal dashboard with no public pages to index. Its cost on a Pi is real: a Next.js production deployment needs a persistent Node server process (or a much heavier build/output setup for static export with caveats around dynamic routes and API routes). React + Vite instead compiles to a **pure static bundle**, served by a tiny `nginx` container — a few MB of RAM instead of a running Node runtime, faster cold start, and a smaller Docker image. Given the app is 100% client-rendered against a REST/WebSocket API (not content that benefits from server rendering), Vite is the practical choice for this hardware target.
+
+### 3.4 REST + WebSocket (not GraphQL, not polling-only, not gRPC)
+
+- REST is simple, cacheable, and matches the CRUD-shaped resources here (sensors, history, alarms, settings, users) — no need for GraphQL's query flexibility for a fixed, small set of screens.
+- WebSocket for live push (readings, alarm transitions, PLC status) avoids REST polling overhead on a low-power device and gives sub-second UI updates, which matters for smoke/water-leak/door alarms.
+- No message broker (Redis/RabbitMQ/MQTT) — with a single backend process and a single frontend audience (the LAN dashboard), an in-process `asyncio` pub/sub (a `ConnectionManager` broadcasting to connected `WebSocket` clients) is sufficient and removes a whole extra service to run/monitor/backup on the Pi. Revisit only if this grows into a multi-Pi fleet with a central aggregator.
+
+### 3.5 Single backend process, not split microservices
+
+The PLC poller and the REST/WebSocket API run as **asyncio tasks inside one FastAPI process** (started from the `lifespan` context), not as separate containers. Reasons:
+- SQLite is much happier with one writer process than several containers fighting over file locks.
+- On a single Pi there's no scaling benefit to splitting them — it would only add IPC complexity (would need a queue or shared DB polling to hand data from a separate poller container to the API container).
+- Internally the code is still modular (`app/plc`, `app/workers`, `app/api` are separate packages with clean boundaries) so splitting into separate services later, if a fleet-management use case emerges, is a deployment change, not a redesign.
+
+### 3.6 Auth: JWT, still enforced despite LAN-only
+
+Even though the dashboard never leaves the LAN, this is a physical-safety-relevant system (smoke, water leak, door, environmental thresholds for hardware protecting infra) — insider mistakes and shared terminals are still a risk. JWT (short-lived access token + refresh token) with bcrypt/argon2-hashed passwords and three roles (`admin`, `operator`, `viewer`) is cheap to build and prevents "anyone on the LAN can silently change alarm thresholds or acknowledge a real smoke alarm."
+
+---
+
+## 4. PLC Communication Layer
+
+### 4.1 Abstraction
+
+```python
+class PLCClient(Protocol):
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def read_tags(self, tags: list[TagDefinition]) -> dict[str, RawValue]: ...
+    def is_connected(self) -> bool: ...
+```
+
+`S7PLCClient` wraps `python-snap7` (`client.db_read(db_number, start, size)` + `snap7.util.get_real/get_bool/get_int`). `ModbusPLCClient` wraps `pymodbus` (`read_holding_registers` / `read_coils`). Both are synchronous libraries under the hood — calls are wrapped in `asyncio.to_thread` so a slow/hung PLC socket never blocks the event loop (and therefore never blocks the API or WebSocket from serving already-known data).
+
+### 4.2 Tag map (`config/plc_tags.yaml`)
+
+Given by the PLC team, consumed without code changes:
+
+```yaml
+tags:
+  - name: temp_rack_a
+    kind: analog
+    sensor_type: TEMPERATURE
+    s7: { db: 10, offset: 0, type: REAL }
+    modbus: { register: 40001, type: FLOAT32 }
+    scale: { raw_min: 0, raw_max: 27648, eng_min: 0, eng_max: 50, unit: "°C" }
+    poll_tier: normal
+  - name: door_main
+    kind: digital
+    sensor_type: DOOR
+    s7: { db: 10, offset: 40, bit: 0 }
+    modbus: { register: 1, type: COIL }
+    poll_tier: fast
+```
+
+### 4.3 Tiered polling
+
+- **Fast tier (default 500 ms–1 s):** smoke, water leak, door — safety-relevant digital signals.
+- **Normal tier (default 2–5 s, configurable):** temperature, humidity, other analog values.
+
+Each tier is its own `asyncio` loop so a slow analog scan never delays a smoke-detector read.
+
+### 4.4 Resilience
+
+Connection state machine: `DISCONNECTED → CONNECTING → CONNECTED → ERROR`. On failure: exponential backoff reconnect (1s, 2s, 5s, 10s, 30s cap), circuit breaker to stop hammering a PLC that's mid-reboot. Readings taken while disconnected are never fabricated — the last-known value is flagged `STALE` after `poll_interval × missed_cycles`, and a `PLC_OFFLINE` alarm fires only after a configurable grace period (default 10 s) to avoid false trips on a one-cycle network blip.
+
+---
+
+## 5. Validation Layer
+
+Every raw read passes through, before it ever reaches the database:
+1. **Type/decode check** — malformed bytes → `BAD` quality, not a crash.
+2. **Range check** — physically implausible values (e.g., -50°C, 150% RH) → `BAD`, logged, not stored as truth (but the raw sample is kept in `SystemLog` for diagnosis).
+3. **Rate-of-change check** — a temperature jump of 40°C in one poll cycle is far more likely a sensor/wiring fault than reality → flagged, triggers `SENSOR_FAILURE` candidate.
+4. **Staleness check** — timestamp gap vs. expected poll interval → `STALE`.
+5. Only `GOOD` (and deliberately-flagged `STALE`) readings continue to the Alarm Engine and Repository layer; every reading, regardless of quality, is timestamped and quality-tagged in `SensorReading` so history isn't silently missing data — it explains *why* a gap or spike exists.
+
+---
+
+## 6. Database Schema
+
+```
+Sensor ──1:N── SensorReading
+Sensor ──1:N── SensorReadingHourly / SensorReadingDaily (rollups)
+Sensor ──1:N── AlarmRule
+AlarmRule ──1:N── Alarm
+Sensor ──1:N── Alarm (nullable — some alarms, e.g. PLC_OFFLINE, aren't sensor-scoped)
+User ──1:N── Alarm (acknowledged_by, nullable)
+User ──1:N── Configuration (updated_by, nullable)
+User ──1:N── SystemLog (actor, nullable — many SystemLog entries are system-generated)
+```
+
+| Table | Key columns | Notes |
+|---|---|---|
+| **Sensor** | `id PK`, `tag_name` (unique, matches `plc_tags.yaml`), `display_name`, `sensor_type` (enum: TEMPERATURE/HUMIDITY/SMOKE/WATER_LEAK/DOOR/CUSTOM), `unit`, `location`, `is_active`, `created_at`, `updated_at` | Display name/location editable from Settings without touching the tag map. |
+| **SensorReading** | `id PK`, `sensor_id FK`, `value`, `quality` (GOOD/BAD/STALE), `timestamp` (indexed), `synced_at` (nullable — Atlas sync outbox marker) | Raw time series. Retention-limited (§9). |
+| **SensorReadingHourly / …Daily** | `sensor_id FK`, `bucket_start`, `min`, `max`, `avg`, `sample_count` | Rollups so long-range history graphs don't scan millions of raw rows or bloat SD storage. |
+| **AlarmRule** | `id PK`, `sensor_id FK` (nullable — global rules like PLC_OFFLINE), `alarm_type` (TEMP_HIGH/TEMP_LOW/HUMIDITY_HIGH/HUMIDITY_LOW/SMOKE/DOOR_OPEN/WATER_LEAK/PLC_OFFLINE/SENSOR_FAILURE), `threshold_value` (nullable for digital), `hysteresis`, `min_duration_seconds` (debounce), `severity` (INFO/WARNING/CRITICAL), `is_enabled` | The configurable-threshold requirement lives here, editable via Settings. |
+| **Alarm** | `id PK`, `rule_id FK`, `sensor_id FK` (nullable), `state` (ACTIVE/ACKNOWLEDGED/CLEARED), `triggered_value`, `triggered_at`, `acknowledged_at`, `acknowledged_by FK→User` (nullable), `cleared_at`, `message` | One row per alarm *instance/episode*, not per poll — this is the Events/alarm-history table. |
+| **User** | `id PK`, `username` (unique), `hashed_password`, `role` (ADMIN/OPERATOR/VIEWER), `is_active`, `created_at`, `last_login_at` | |
+| **SystemLog** | `id PK`, `timestamp`, `level` (INFO/WARNING/ERROR/CRITICAL), `category` (PLC_CONNECTION/SYSTEM_RESTART/AUTH/CONFIG_CHANGE/BACKUP), `message`, `meta` (JSON text) | Connection failures, restarts, config changes, backup outcomes — the Events page "system logs" tab. |
+| **Configuration** | `key PK`, `value`, `value_type`, `updated_at`, `updated_by FK→User` (nullable) | Runtime-editable settings (poll interval, sensor display names default, session timeout, Atlas sync toggle). |
+
+---
+
+## 7. REST API Design
+
+All under `/api/v1`, JSON, JWT bearer auth (except `/auth/login`).
+
+**Auth**
+- `POST /auth/login` — returns access + refresh token
+- `POST /auth/refresh`
+- `POST /auth/logout`
+- `GET /auth/me`
+
+**Live**
+- `GET /live` — snapshot: all sensors' latest value/quality, PLC connection status, Pi health summary, active alarm count
+- `GET /live/{sensor_id}`
+
+**History**
+- `GET /history?sensor_id=&start=&end=&resolution=raw|hourly|daily`
+- `GET /history/export?...` — CSV stream
+
+**Alarms / Events**
+- `GET /alarms?state=&severity=&start=&end=`
+- `POST /alarms/{id}/acknowledge`
+- `GET /events` — SystemLog feed (connection failures, restarts, config changes)
+
+**Sensors**
+- `GET /sensors`
+- `POST /sensors` (admin)
+- `PATCH /sensors/{id}` (admin/operator — display name, location)
+
+**Settings**
+- `GET /settings` / `PUT /settings` — poll interval, session timeout, etc.
+- `GET /settings/alarm-rules` / `PUT /settings/alarm-rules/{id}` — thresholds, hysteresis, debounce, severity
+
+**Users** (admin only)
+- `GET /users`, `POST /users`, `PATCH /users/{id}`, `DELETE /users/{id}`
+
+**System**
+- `GET /system/health` — CPU%, RAM%, disk%, SQLite file size, uptime, PLC status
+
+**WebSocket**
+- `WS /ws/live` — pushes `{"type": "reading"|"alarm"|"plc_status"|"system_health", "data": {...}}` frames; the same envelope shape the frontend store consumes for all four dashboard live-update needs.
+
+---
+
+## 8. Alert System
+
+State machine per alarm instance: `NORMAL → ACTIVE → ACKNOWLEDGED → CLEARED` (an operator can acknowledge while still active; it auto-clears when the underlying condition returns within the hysteresis band for `min_duration_seconds`).
+
+- **Hysteresis (deadband):** e.g. TEMP_HIGH trips at 30°C, clears only below 28°C — prevents rapid flapping around the exact threshold.
+- **Debounce:** condition must hold for `min_duration_seconds` before an alarm fires — prevents a single noisy sample from creating an alarm.
+- **Severity:** INFO/WARNING/CRITICAL drives dashboard styling and (future) notification routing.
+- Covers all nine required types: Temp High/Low, Humidity High/Low, Smoke, Door Open, Water Leak, PLC Offline, Sensor Failure (the last driven by the Validation Layer's rate-of-change/range flags, not a raw threshold).
+
+---
+
+## 9. Historical Logging & Retention
+
+Raw `SensorReading` rows are kept for a configurable window (default 90 days), then a nightly worker rolls them into `SensorReadingHourly`/`SensorReadingDaily` aggregates and prunes the raw rows older than the window — keeping the History page's long-range charts fast and the SD card from filling up. `VACUUM`/WAL checkpoint runs as part of the same nightly job.
+
+---
+
+## 10. Configuration Management
+
+Two tiers, deliberately different lifecycles:
+- **Infra-level** (`.env`, loaded once via `pydantic-settings`): DB path, PLC IP/rack/slot, ports, JWT secret, Atlas connection string. Changing these requires a restart — they're deployment facts, not runtime tuning.
+- **Runtime-level** (`Configuration` table, editable from the Settings page without restart): poll interval, sensor display names, alarm thresholds/hysteresis/debounce, Atlas sync on/off. The poller and alarm engine read an in-memory cache of this table, invalidated the moment `PUT /settings` succeeds — so a threshold change takes effect on the next poll cycle, not after a redeploy.
+
+---
+
+## 11. Deployment (Docker Compose)
+
+Two services:
+- **`backend`** — FastAPI + poller + workers in one container (§3.5). Volume-mounts the SQLite file and log directory onto the host so they survive container recreation and are reachable by the backup script. `restart: unless-stopped`. Healthcheck hits `GET /system/health` and fails if the last successful PLC poll is older than N cycles.
+- **`frontend`** — nginx serving the Vite static build, reverse-proxying `/api` and `/ws` to `backend`. `restart: unless-stopped`.
+
+Networking: standard Docker bridge network is sufficient — the poller only makes *outbound* connections to the PLC's LAN IP (port 102 or 502), which works fine through the bridge/NAT; host networking isn't needed since the PLC never needs to initiate a connection back into the container. Only the frontend's port 80/443 is published to the LAN.
+
+---
+
+## 12. Backup Strategy
+
+- **Local (always on):** nightly job uses SQLite's online backup API (`sqlite3 .backup`, not a raw file copy, so it's crash-consistent even against a live WAL) to a timestamped file under a `/backups` volume; rotation keeps the last 14 daily + 12 monthly snapshots.
+- **Remote (optional, best-effort):** an outbox pattern — `SensorReading`/`Alarm`/`SystemLog` carry a nullable `synced_at`. A background worker periodically probes internet reachability and, when available, batch-upserts unsynced rows to MongoDB Atlas, with backoff on failure. This worker is fully decoupled from the core write path — if it's stuck, disabled, or the internet is down for a month, ingestion/alarms/dashboard are unaffected; the backlog just grows until connectivity returns (with a log warning if the local backlog crosses a size threshold).
+
+---
+
+## 13. Error Handling & Resilience
+
+- PLC layer: backoff + circuit breaker (§4.4).
+- API layer: global exception handlers → structured JSON logs, no unhandled 500s leak stack traces to the client.
+- Frontend: WebSocket client auto-reconnects with backoff and shows a "Reconnecting…" banner instead of silently going stale.
+- Docker healthchecks restart a container that's stopped producing fresh data, without operator intervention.
+
+---
+
+## 14. Recovery After Power Failure
+
+- Docker daemon enabled via `systemctl enable docker`; all services `restart: unless-stopped` — on power restoration the Pi boots, Docker starts, containers start, no manual step required.
+- SQLite in WAL mode with `PRAGMA synchronous=NORMAL`: safe automatic recovery from an unclean shutdown without a manual repair step.
+- Startup logs a `SYSTEM_RESTART` `SystemLog` entry; a `clean_shutdown` marker file (removed at startup, rewritten by a graceful-shutdown handler) lets us tell a clean restart apart from a crash/power-loss in that log entry.
+- Hardware recommendation (not software-enforced): a small UPS/PoE with battery buys time for graceful shutdown and protects the SD card from a write-in-progress power cut.
+
+---
+
+## 15. Security
+
+JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`operator`/`viewer`), login rate-limiting, JWT secret from `.env` only (never committed). HTTPS via an internal/self-signed cert is recommended even on LAN, since credentials still traverse the network in plaintext otherwise.
+
+---
+
+## 16. Coding Standards
+
+- SOLID + Repository Pattern (`app/repositories`) + Dependency Injection via FastAPI `Depends` — services and routers depend on repository *interfaces*, making unit tests swap in an in-memory SQLite or fakes trivially.
+- Full type hints, Pydantic v2 schemas for every request/response (`app/schemas`), never raw dicts across a boundary.
+- `asyncio` throughout the backend; blocking PLC I/O isolated via `asyncio.to_thread`.
+- Structured logging (JSON), unit tests per module (`backend/tests/unit`) plus integration tests (`backend/tests/integration`, `tests/e2e`) exercising the full poll → validate → store → API path against an in-memory PLC simulator.
+- All secrets/environment-specific values via `.env` (see `docker/.env.example`), never hard-coded.
+
+---
+
+## 17. Implementation Roadmap (module-by-module, each production-ready before the next)
+
+1. **Database layer** — SQLAlchemy models, Alembic migrations, repositories, seed data.
+2. **PLC communication layer** — `PLCClient` interface + S7 implementation (default) + Modbus implementation, tag map loader, tiered poller, connection resilience — tested against a simulator before real PLC access is available.
+3. **Validation layer + Alarm engine** — quality flags, rule evaluation, state machine.
+4. **REST API** — auth, live/history/alarms/sensors/settings/users/system endpoints.
+5. **WebSocket real-time layer**.
+6. **Frontend** — Dashboard, then History, Events, Settings, System pages.
+7. **Background workers** — retention/rollup, local backup, optional Atlas sync.
+8. **Docker Compose deployment** + Raspberry Pi OS setup script.
+9. **Hardening pass** — resilience/error-handling review, recovery-after-power-failure drill, security review.
+
+This order is deliberate: the database and PLC layers are the foundation everything else reads from, so they're built and proven first; the frontend comes after the API contract is stable so it isn't built against a moving target.
