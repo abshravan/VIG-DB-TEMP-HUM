@@ -253,6 +253,8 @@ All under `/api/v1`, JSON, JWT bearer auth (except `/auth/login`).
 **WebSocket**
 - `WS /ws/live` — pushes `{"type": "reading"|"alarm"|"plc_status"|"system_health", "data": {...}}` frames; the same envelope shape the frontend store consumes for all four dashboard live-update needs.
 
+**Implementation note:** `ConnectionManager` (`backend/app/realtime/connection_manager.py`) is the in-process pub/sub broadcaster from §3.4 — created once in `create_app()` (not inside the PLC lifespan) so `/ws/live` works independently of whether the PLC poller is running. Browsers can't set a custom `Authorization` header on a WebSocket handshake, so auth is `?token=<jwt access token>` as a query parameter, validated the same way as REST (`decode_token` + an active-user check) before `accept()`. `ReadingIngestionService` broadcasts a `reading` frame after every stored poll cycle and an `alarm` frame whenever `AlarmEngine.evaluate()` reports a state change (it now returns the changed `Alarm` or `None` for exactly this); `plc_status` is broadcast on every `ResilientPLCConnection` state change; `system_health` is pushed every 10s by a small background task (`app/realtime/health_broadcaster.py`), skipped entirely when no client is connected. Verified against a real `uvicorn` process and a real `websockets` client (not just the test suite) — connect, then receive a live `system_health` frame over the wire.
+
 ---
 
 ## 8. Alert System
@@ -338,7 +340,7 @@ JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`oper
 2. ✅ **PLC communication layer** — `PLCClient` interface + S7 implementation (default) + Modbus implementation, tag map loader, tiered poller, connection resilience — tested against a simulator before real PLC access is available.
 3. ✅ **Validation layer + Alarm engine** — quality flags, rule evaluation, state machine.
 4. ✅ **REST API** — auth, live/history/alarms/sensors/settings/users/system endpoints.
-5. **WebSocket real-time layer**.
+5. ✅ **WebSocket real-time layer**.
 6. **Frontend** — Dashboard, then History, Events, Settings, System pages.
 7. **Background workers** — retention/rollup, local backup, optional Atlas sync.
 8. **Docker Compose deployment** + Raspberry Pi OS setup script.

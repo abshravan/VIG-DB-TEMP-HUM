@@ -71,9 +71,13 @@ class AlarmEngine:
         rule: AlarmRule,
         value: float,
         now: datetime,
-    ) -> None:
+    ) -> Alarm | None:
+        """Returns the `Alarm` that just changed state (newly created or newly cleared) this
+        call, or `None` if nothing changed — callers (the ingestion pipeline) use this to know
+        what to broadcast over the WebSocket without re-deriving it from scratch.
+        """
         if not rule.is_enabled:
-            return
+            return None
         candidate = self._candidates.setdefault(rule.id, _AlarmCandidate())
 
         if candidate.open_alarm_id is None:
@@ -93,17 +97,22 @@ class AlarmEngine:
                         )
                     )
                     candidate.open_alarm_id = alarm.id
+                    alarm.rule = rule  # avoid a re-fetch just to broadcast alarm_type/severity
+                    return alarm
             else:
                 candidate.condition_since = None
-            return
+            return None
 
         if _is_clear_condition(rule, value):
             alarm = await alarm_repo.get(candidate.open_alarm_id)
+            candidate.open_alarm_id = None
+            candidate.condition_since = None
             if alarm is not None and alarm.state != AlarmState.CLEARED:
                 alarm.state = AlarmState.CLEARED
                 alarm.cleared_at = now
-            candidate.open_alarm_id = None
-            candidate.condition_since = None
+                alarm.rule = rule
+                return alarm
+        return None
 
     async def acknowledge(self, alarm_repo: AlarmRepository, alarm_id: int, user_id: int, now: datetime) -> Alarm | None:
         alarm = await alarm_repo.get(alarm_id)

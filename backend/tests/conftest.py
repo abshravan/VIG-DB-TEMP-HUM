@@ -3,7 +3,7 @@ from collections.abc import AsyncGenerator
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base, get_db
@@ -15,12 +15,11 @@ from app.models.user import User
 from app.repositories import UserRepository
 
 
-@pytest_asyncio.fixture
-async def session_maker() -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
-    """Fresh in-memory SQLite DB per test, full schema created from the ORM models (not a
-    fixture file) so schema drift between models and tests is impossible. Yields a session
-    *factory* bound to that one engine — needed by anything (like the ingestion pipeline)
-    that opens more than one session against the same schema within a test.
+async def build_session_maker() -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
+    """Plain async helper (not a fixture) so both the `session_maker` pytest fixture *and*
+    the WebSocket tests (which must run as plain sync functions — see test_ws_live.py's
+    module docstring for why — and so drive this via `asyncio.run` instead of fixture
+    injection) can build an identical fresh in-memory DB.
     """
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -36,8 +35,18 @@ async def session_maker() -> AsyncGenerator[async_sessionmaker[AsyncSession], No
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    yield async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    return engine, async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
+
+@pytest_asyncio.fixture
+async def session_maker() -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    """Fresh in-memory SQLite DB per test, full schema created from the ORM models (not a
+    fixture file) so schema drift between models and tests is impossible. Yields a session
+    *factory* bound to that one engine — needed by anything (like the ingestion pipeline)
+    that opens more than one session against the same schema within a test.
+    """
+    engine, maker = await build_session_maker()
+    yield maker
     await engine.dispose()
 
 

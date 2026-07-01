@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -15,6 +16,9 @@ from app.plc.connection import ResilientPLCConnection
 from app.plc.factory import build_plc_client
 from app.plc.poller import PLCPoller
 from app.plc.tags import load_tag_map
+from app.realtime.connection_manager import ConnectionManager
+from app.realtime.health_broadcaster import run_periodic_health_broadcast
+from app.realtime.router import router as realtime_router
 from app.services.alarm_engine import AlarmEngine
 from app.services.ingestion import ReadingIngestionService
 from app.services.validation import ReadingValidator
@@ -25,16 +29,21 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Wires PLC -> Poller -> Validation -> Alarm Engine -> Repository (ARCHITECTURE.md's data
-    flow) as background asyncio tasks alongside the API, per §3.5 — one process, not split
-    containers. `app.state.plc_connection` is read by the /live and /system/health endpoints.
+    """Wires PLC -> Poller -> Validation -> Alarm Engine -> Repository -> WebSocket
+    (ARCHITECTURE.md's data flow) as background asyncio tasks alongside the API, per §3.5 —
+    one process, not split containers. `app.state.plc_connection` is read by the /live and
+    /system/health endpoints; `app.state.connection_manager` is created in `create_app()`
+    (not here) so `/ws/live` works even in tests that don't enter this lifespan.
     """
     settings = get_settings()
     tag_map = load_tag_map(settings.tag_map_path)
     client = build_plc_client(settings)
     validator = ReadingValidator()
     alarm_engine = AlarmEngine()
-    ingestion = ReadingIngestionService(async_session_maker, tag_map, validator, alarm_engine)
+    connection_manager: ConnectionManager = app.state.connection_manager
+    ingestion = ReadingIngestionService(
+        async_session_maker, tag_map, validator, alarm_engine, broadcaster=connection_manager.broadcast
+    )
 
     async def on_state_change(state: ConnectionState) -> None:
         await ingestion.handle_connection_state_change(state, utcnow())
@@ -46,10 +55,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.tag_map = tag_map
 
     await poller.start()
+    health_task = asyncio.create_task(
+        run_periodic_health_broadcast(connection_manager, lambda: connection.state == ConnectionState.CONNECTED)
+    )
     logger.info("PLC poller started (protocol=%s, address=%s)", settings.plc_protocol, settings.plc_address)
     try:
         yield
     finally:
+        health_task.cancel()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
         await poller.stop()
         await client.disconnect()
         logger.info("PLC poller stopped")
@@ -58,6 +75,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
+    app.state.connection_manager = ConnectionManager()
 
     app.add_middleware(
         CORSMiddleware,
@@ -68,6 +86,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(api_router, prefix="/api/v1")
+    app.include_router(realtime_router)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
