@@ -126,6 +126,25 @@ export interface SystemHealth {
   server_time: string;
 }
 
+// PLC simulation control (backend/app/api/v1/system.py `/simulate` endpoints), only
+// reachable when the backend is running with PLC_PROTOCOL=simulated.
+export interface SimulatedTag {
+  name: string;
+  kind: "analog" | "digital";
+  sensor_type: SensorType;
+  unit: string | null;
+  eng_min: number | null;
+  eng_max: number | null;
+  current_value: number | boolean | null;
+  failing: boolean;
+}
+
+export interface SimulationStatus {
+  active: boolean;
+  plc_offline: boolean;
+  tags: SimulatedTag[];
+}
+
 // WebSocket envelope, ARCHITECTURE.md §7.
 export type WsMessage =
   | { type: "reading"; data: { timestamp: string; readings: WsReading[] } }

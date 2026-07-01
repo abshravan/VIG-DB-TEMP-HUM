@@ -140,6 +140,8 @@ class PLCClient(Protocol):
 
 `S7PLCClient` wraps `python-snap7` (`client.db_read(db_number, start, size)` + `snap7.util.get_real/get_bool/get_int`). `ModbusPLCClient` wraps `pymodbus` (`read_holding_registers` / `read_coils`). Both are synchronous libraries under the hood — calls are wrapped in `asyncio.to_thread` so a slow/hung PLC socket never blocks the event loop (and therefore never blocks the API or WebSocket from serving already-known data).
 
+A third implementation, `SimulatedPLCClient`, needs no hardware or network at all: analog tags drift randomly within their configured `eng_min`/`eng_max` range, digital tags default to `false`, and every value can be pinned. Selected the same way as the other two — `PLC_PROTOCOL=simulated` — for local development, demos, and integration tests. Its `set_value`/`set_tag_failing`/`set_force_disconnected` methods, originally built for the test suite, are also reachable at runtime through an admin-only `/api/v1/system/simulate` REST surface (`app/api/v1/system.py`), so an operator can drive a specific scenario (a temperature spike, a stuck sensor, a PLC gone dark) through the dashboard without touching code. The endpoints return `409` if the app isn't actually running `PLC_PROTOCOL=simulated` — there's nothing to control against a real PLC.
+
 ### 4.2 Tag map (`config/plc_tags.yaml`)
 
 Given by the PLC team, consumed without code changes:

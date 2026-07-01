@@ -9,6 +9,12 @@ class SimulatedPLCClient(PLCClient):
     clients. Used for development and automated tests before real PLC network access is
     available (ARCHITECTURE.md §17, Module 2) — the poller, validation layer, and alarm engine
     all exercise identical code paths against this as against real hardware.
+
+    Selected at runtime via `PLC_PROTOCOL=simulated` (`app/plc/factory.py`); the `set_*`
+    methods below are then reachable at runtime through the admin-only
+    `/api/v1/system/simulate` endpoints (`app/api/v1/system.py`) so an operator can drive
+    specific scenarios (a temperature spike, a stuck sensor, a PLC that drops off the network)
+    without any hardware.
     """
 
     def __init__(self, seed: int | None = None) -> None:
@@ -30,21 +36,30 @@ class SimulatedPLCClient(PLCClient):
         return self._connected
 
     def set_force_disconnected(self, disconnected: bool) -> None:
-        """Test hook: simulate the PLC going offline, or coming back."""
+        """Simulate the PLC going offline, or coming back."""
         self._force_disconnected = disconnected
         if disconnected:
             self._connected = False
 
     def set_tag_failing(self, tag_name: str, failing: bool) -> None:
-        """Test hook: simulate a single sensor/wiring fault without taking down the whole PLC."""
+        """Simulate a single sensor/wiring fault without taking down the whole PLC."""
         if failing:
             self._failing_tags.add(tag_name)
         else:
             self._failing_tags.discard(tag_name)
 
     def set_value(self, tag_name: str, value: float | bool) -> None:
-        """Test hook: pin a tag to an exact value (e.g. to trigger an alarm threshold)."""
+        """Pin a tag to an exact value (e.g. to trigger an alarm threshold). Used by tests and
+        by the admin simulation API (`/api/v1/system/simulate`, PLC_PROTOCOL=simulated).
+        """
         self._values[tag_name] = value
+
+    def get_value(self, tag_name: str) -> float | bool | None:
+        """Current pinned/drifted value for a tag, or `None` if it hasn't been read yet."""
+        return self._values.get(tag_name)
+
+    def is_tag_failing(self, tag_name: str) -> bool:
+        return tag_name in self._failing_tags
 
     async def read_tags(self, tags: list[TagDefinition]) -> dict[str, TagReadResult]:
         if not self._connected:

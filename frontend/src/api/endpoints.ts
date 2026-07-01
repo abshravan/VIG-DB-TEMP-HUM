@@ -9,6 +9,7 @@ import type {
   LiveStatus,
   Sensor,
   SensorType,
+  SimulationStatus,
   SystemHealth,
   SystemLog,
   TokenResponse,
@@ -142,4 +143,21 @@ export async function deleteUser(userId: number): Promise<void> {
 export async function fetchSystemHealth(): Promise<SystemHealth> {
   const response = await apiClient.get<SystemHealth>("/system/health");
   return response.data;
+}
+
+export async function fetchSimulationStatus(): Promise<SimulationStatus> {
+  const response = await apiClient.get<SimulationStatus>("/system/simulate");
+  return response.data;
+}
+
+export async function setSimulatedTagValue(tagName: string, value: number | boolean): Promise<void> {
+  await apiClient.put(`/system/simulate/tags/${tagName}`, { value });
+}
+
+export async function setSimulatedTagFailure(tagName: string, failing: boolean): Promise<void> {
+  await apiClient.put(`/system/simulate/tags/${tagName}/failure`, { failing });
+}
+
+export async function setSimulatedPlcConnection(disconnected: boolean): Promise<void> {
+  await apiClient.put("/system/simulate/plc-connection", { disconnected });
 }

@@ -27,15 +27,20 @@ class Settings(BaseSettings):
     database_url: str = DEFAULT_DATABASE_URL
     sql_echo: bool = False
 
-    # PLC communication (ARCHITECTURE.md §3.1, §4.1) — switching s7<->modbus is this one value,
-    # never a code change, since both PLCClient implementations share the same interface.
-    plc_protocol: Literal["s7", "modbus"] = "s7"
+    # PLC communication (ARCHITECTURE.md §3.1, §4.1) — switching s7<->modbus<->simulated is
+    # this one value, never a code change, since all three PLCClient implementations share
+    # the same interface. "simulated" needs no PLC hardware/network at all — useful for
+    # local development, demos, and dashboard testing before the real PLC is reachable.
+    plc_protocol: Literal["s7", "modbus", "simulated"] = "s7"
     plc_address: str = "192.168.1.10"
     plc_rack: int = 0
     plc_slot: int = 1
     plc_s7_port: int = 102
     plc_modbus_port: int = 502
     tag_map_path: str = DEFAULT_TAG_MAP_PATH
+    # Only used when plc_protocol == "simulated". A fixed seed makes the simulated readings
+    # reproducible run-to-run; leave unset for different random drift each run.
+    plc_sim_seed: int | None = None
 
     # JWT auth (ARCHITECTURE.md §3.6, §15). The default secret is only for first-run local
     # dev — every real deployment must set JWT_SECRET_KEY in .env to a random value.

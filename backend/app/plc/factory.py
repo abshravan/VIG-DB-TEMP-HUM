@@ -2,6 +2,7 @@ from app.core.config import Settings
 from app.plc.base import PLCClient
 from app.plc.modbus_client import ModbusPLCClient
 from app.plc.s7_client import S7PLCClient
+from app.plc.simulator import SimulatedPLCClient
 
 
 def build_plc_client(settings: Settings) -> PLCClient:
@@ -18,4 +19,6 @@ def build_plc_client(settings: Settings) -> PLCClient:
         )
     if settings.plc_protocol == "modbus":
         return ModbusPLCClient(address=settings.plc_address, port=settings.plc_modbus_port)
+    if settings.plc_protocol == "simulated":
+        return SimulatedPLCClient(seed=settings.plc_sim_seed)
     raise ValueError(f"unsupported PLC_PROTOCOL: {settings.plc_protocol}")

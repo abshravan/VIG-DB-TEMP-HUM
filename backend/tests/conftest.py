@@ -72,6 +72,7 @@ async def api_client(
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
+        client.app = app  # lets tests reach app.state (e.g. to install a fake plc_connection)
         yield client
 
 

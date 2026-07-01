@@ -70,3 +70,22 @@ async def test_failing_tag_reports_error_without_affecting_others():
     assert results[ANALOG_TAG.name].ok is False
     assert results[ANALOG_TAG.name].error is not None
     assert results[DIGITAL_TAG.name].ok is True
+
+
+async def test_get_value_reflects_pinned_and_unset_tags():
+    client = SimulatedPLCClient()
+    assert client.get_value(ANALOG_TAG.name) is None
+
+    client.set_value(ANALOG_TAG.name, 42.0)
+    assert client.get_value(ANALOG_TAG.name) == 42.0
+
+
+async def test_is_tag_failing_reflects_set_tag_failing():
+    client = SimulatedPLCClient()
+    assert client.is_tag_failing(ANALOG_TAG.name) is False
+
+    client.set_tag_failing(ANALOG_TAG.name, True)
+    assert client.is_tag_failing(ANALOG_TAG.name) is True
+
+    client.set_tag_failing(ANALOG_TAG.name, False)
+    assert client.is_tag_failing(ANALOG_TAG.name) is False
