@@ -1,0 +1,14 @@
+# Auto-loaded by `docker compose up` alongside docker-compose.yml. Day-to-day development
+# runs the backend/frontend directly on the host (uvicorn + vite dev, per their READMEs) —
+# this override just makes the containerized stack easier to poke at directly when you do
+# need to test the actual Docker build locally, e.g. before a Pi deployment.
+services:
+  backend:
+    ports:
+      - "8000:8000" # hit the API directly, bypassing the nginx proxy
+    restart: "no" # don't fight docker's restart loop while iterating
+    environment:
+      SQL_ECHO: "true"
+
+  frontend:
+    restart: "no"

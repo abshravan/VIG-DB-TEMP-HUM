@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Anchored to the container filesystem, not the backend package's install location —
+      # see backend/README.md's note on why infra paths are always explicit env vars here.
+      DATABASE_URL: sqlite+aiosqlite:////app/data/monitoring.db
+      TAG_MAP_PATH: /app/config/plc_tags.yaml
+    volumes:
+      - db-data:/app/data
+      - backups:/app/backups
+      # Read-only: the PLC team's tag map is edited on the host and picked up on restart,
+      # without needing to rebuild the image.
+      - ../config/plc_tags.yaml:/app/config/plc_tags.yaml:ro
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    networks:
+      - monitoring
+
+volumes:
+  db-data:
+  backups:
+
+networks:
+  monitoring:
+    driver: bridge

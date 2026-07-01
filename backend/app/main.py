@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
@@ -115,6 +116,23 @@ def create_app() -> FastAPI:
 
     app.include_router(api_router, prefix="/api/v1")
     app.include_router(realtime_router)
+
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> JSONResponse:
+        """Unauthenticated liveness probe for Docker/orchestration (ARCHITECTURE.md §11) —
+        distinct from the rich, authenticated `GET /api/v1/system/health` used by the
+        dashboard. Deliberately checks only "is this process alive and can it reach its own
+        database," not PLC connectivity: an unreachable PLC already surfaces as a PLC_OFFLINE
+        alarm on the dashboard, and restarting the API container can't fix a PLC network
+        problem — it would just take the dashboard away right when an operator needs it most.
+        """
+        try:
+            async with async_session_maker() as session:
+                await session.execute(text("SELECT 1"))
+            return JSONResponse({"status": "ok"})
+        except Exception:
+            logger.exception("healthz check failed")
+            return JSONResponse({"status": "error"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:

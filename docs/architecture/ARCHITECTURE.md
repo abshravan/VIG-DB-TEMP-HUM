@@ -287,11 +287,13 @@ Two tiers, deliberately different lifecycles:
 
 ## 11. Deployment (Docker Compose)
 
-Two services:
-- **`backend`** — FastAPI + poller + workers in one container (§3.5). Volume-mounts the SQLite file and log directory onto the host so they survive container recreation and are reachable by the backup script. `restart: unless-stopped`. Healthcheck hits `GET /system/health` and fails if the last successful PLC poll is older than N cycles.
+Two services (`docker/docker-compose.yml`):
+- **`backend`** — FastAPI + poller + workers in one container (§3.5), built from `backend/Dockerfile` with the repository root as build context (not `backend/` alone) so the image can also bundle `database/seed/seed.py` and the default `config/plc_tags.yaml` — both live outside `backend/`. Named volumes persist `/app/data` (the SQLite file) and `/app/backups` across container recreation; `config/plc_tags.yaml` is bind-mounted read-only so the PLC team's tag map can be edited without a rebuild. `restart: unless-stopped`.
 - **`frontend`** — nginx serving the Vite static build, reverse-proxying `/api` and `/ws` to `backend`. `restart: unless-stopped`.
 
 Networking: standard Docker bridge network is sufficient — the poller only makes *outbound* connections to the PLC's LAN IP (port 102 or 502), which works fine through the bridge/NAT; host networking isn't needed since the PLC never needs to initiate a connection back into the container. Only the frontend's port 80/443 is published to the LAN.
+
+**Healthcheck design note:** the backend's Docker healthcheck hits a new unauthenticated `GET /healthz` (distinct from the rich, JWT-protected `GET /api/v1/system/health` the dashboard uses) — and deliberately checks only "is this process alive and can it reach its own database," **not** PLC connectivity. Gating container health on the PLC being reachable would make Docker restart the API container whenever the PLC merely goes offline — which can't fix a PLC network problem, and would take the dashboard away right when an operator most needs to see the resulting `PLC_OFFLINE` alarm. python-snap7 3.x turned out to be a pure-Python S7 implementation (confirmed at runtime: "S7Client initialized (pure Python implementation)"), so — unlike older snap7 releases — the backend image needs no system-level `libsnap7.so` package, just Python.
 
 ---
 
@@ -345,7 +347,7 @@ JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`oper
 5. ✅ **WebSocket real-time layer**.
 6. ✅ **Frontend** — Dashboard, then History, Events, Settings, System pages.
 7. ✅ **Background workers** — retention/rollup, local backup, optional Atlas sync.
-8. **Docker Compose deployment** + Raspberry Pi OS setup script.
+8. ✅ **Docker Compose deployment** + Raspberry Pi OS setup script.
 9. **Hardening pass** — resilience/error-handling review, recovery-after-power-failure drill, security review.
 
 This order is deliberate: the database and PLC layers are the foundation everything else reads from, so they're built and proven first; the frontend comes after the API contract is stable so it isn't built against a moving target.
