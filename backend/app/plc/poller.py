@@ -1,9 +1,10 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import datetime
 
-from app.plc.base import ConnectionState, TagReadResult
+from app.core.time import utcnow
+from app.plc.base import TagReadResult
 from app.plc.connection import ResilientPLCConnection
 from app.plc.tags import TagDefinition, TagMap
 
@@ -56,7 +57,7 @@ class PLCPoller:
                 continue  # ensure_connected() already slept its backoff step
             try:
                 results = await self._connection.client.read_tags(tags)
-                await self._on_readings(results, datetime.now(UTC))
+                await self._on_readings(results, utcnow())
             except Exception as exc:  # noqa: BLE001 — a scan failure must not kill the poll loop
                 logger.warning("[%s tier] poll cycle failed: %s", tier, exc)
             await asyncio.sleep(interval)

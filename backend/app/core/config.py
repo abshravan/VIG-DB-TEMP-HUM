@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     plc_modbus_port: int = 502
     tag_map_path: str = DEFAULT_TAG_MAP_PATH
 
+    # JWT auth (ARCHITECTURE.md §3.6, §15). The default secret is only for first-run local
+    # dev — every real deployment must set JWT_SECRET_KEY in .env to a random value.
+    jwt_secret_key: str = "dev-only-insecure-secret-change-me"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 7
+
+    # How old a sensor's latest reading may be before /live reports it as stale.
+    live_stale_threshold_seconds: int = 30
+
+    cors_allow_origins: list[str] = ["http://localhost:5173"]
+
 
 @lru_cache
 def get_settings() -> Settings:

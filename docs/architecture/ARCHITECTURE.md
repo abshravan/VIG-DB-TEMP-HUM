@@ -120,7 +120,9 @@ The PLC poller and the REST/WebSocket API run as **asyncio tasks inside one Fast
 
 ### 3.6 Auth: JWT, still enforced despite LAN-only
 
-Even though the dashboard never leaves the LAN, this is a physical-safety-relevant system (smoke, water leak, door, environmental thresholds for hardware protecting infra) — insider mistakes and shared terminals are still a risk. JWT (short-lived access token + refresh token) with bcrypt/argon2-hashed passwords and three roles (`admin`, `operator`, `viewer`) is cheap to build and prevents "anyone on the LAN can silently change alarm thresholds or acknowledge a real smoke alarm."
+Even though the dashboard never leaves the LAN, this is a physical-safety-relevant system (smoke, water leak, door, environmental thresholds for hardware protecting infra) — insider mistakes and shared terminals are still a risk. JWT (short-lived access token + refresh token) with bcrypt-hashed passwords and three roles (`admin`, `operator`, `viewer`) is cheap to build and prevents "anyone on the LAN can silently change alarm thresholds or acknowledge a real smoke alarm."
+
+**Implementation note:** both tokens are stateless JWTs — access tokens expire in 30 minutes (default), refresh tokens in 7 days, and there is no server-side revocation list. `POST /auth/logout` exists for API symmetry but the client discarding its tokens is what actually "logs out"; an admin deactivating a user (`is_active=False`) or changing their password stops *future* logins but doesn't invalidate an already-issued unexpired token. This is a deliberate v1 simplification bounded by the short access-token lifetime — a token blacklist (e.g. a `revoked_tokens` table checked in `get_current_user`) is the natural next step if that exposure window ever matters more than the added complexity.
 
 ---
 
@@ -335,7 +337,7 @@ JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`oper
 1. ✅ **Database layer** — SQLAlchemy models, Alembic migrations, repositories, seed data.
 2. ✅ **PLC communication layer** — `PLCClient` interface + S7 implementation (default) + Modbus implementation, tag map loader, tiered poller, connection resilience — tested against a simulator before real PLC access is available.
 3. ✅ **Validation layer + Alarm engine** — quality flags, rule evaluation, state machine.
-4. **REST API** — auth, live/history/alarms/sensors/settings/users/system endpoints.
+4. ✅ **REST API** — auth, live/history/alarms/sensors/settings/users/system endpoints.
 5. **WebSocket real-time layer**.
 6. **Frontend** — Dashboard, then History, Events, Settings, System pages.
 7. **Background workers** — retention/rollup, local backup, optional Atlas sync.
