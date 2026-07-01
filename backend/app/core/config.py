@@ -49,6 +49,16 @@ class Settings(BaseSettings):
 
     cors_allow_origins: list[str] = ["http://localhost:5173"]
 
+    # Background workers (ARCHITECTURE.md §9, §12).
+    raw_retention_days: int = 90
+    retention_run_at: str = "02:00"  # UTC, "HH:MM"
+    backup_run_at: str = "03:00"  # UTC, "HH:MM"
+    # Empty string disables Atlas sync entirely — it's an optional enhancement, never a
+    # dependency for core operation (ARCHITECTURE.md §12).
+    atlas_connection_string: str = ""
+    atlas_database_name: str = "server_room_monitor"
+    atlas_sync_interval_seconds: float = 60.0
+
 
 @lru_cache
 def get_settings() -> Settings:

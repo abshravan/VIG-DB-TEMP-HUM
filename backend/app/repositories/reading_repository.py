@@ -40,3 +40,13 @@ class ReadingRepository(BaseRepository[SensorReading]):
             await self.session.delete(row)
         await self.session.flush()
         return len(rows)
+
+    async def list_unsynced(self, limit: int) -> list[SensorReading]:
+        """Outbox pattern for the optional Atlas sync worker (ARCHITECTURE.md §12)."""
+        result = await self.session.execute(
+            select(SensorReading)
+            .where(SensorReading.synced_at.is_(None))
+            .order_by(SensorReading.timestamp)
+            .limit(limit)
+        )
+        return list(result.scalars().all())

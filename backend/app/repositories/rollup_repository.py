@@ -21,6 +21,14 @@ class ReadingHourlyRepository(BaseRepository[SensorReadingHourly]):
         )
         return list(result.scalars().all())
 
+    async def get_bucket(self, sensor_id: int, bucket_start: datetime) -> SensorReadingHourly | None:
+        result = await self.session.execute(
+            select(SensorReadingHourly)
+            .where(SensorReadingHourly.sensor_id == sensor_id)
+            .where(SensorReadingHourly.bucket_start == bucket_start)
+        )
+        return result.scalar_one_or_none()
+
 
 class ReadingDailyRepository(BaseRepository[SensorReadingDaily]):
     model = SensorReadingDaily
@@ -36,3 +44,11 @@ class ReadingDailyRepository(BaseRepository[SensorReadingDaily]):
             .order_by(SensorReadingDaily.bucket_start)
         )
         return list(result.scalars().all())
+
+    async def get_bucket(self, sensor_id: int, bucket_start: datetime) -> SensorReadingDaily | None:
+        result = await self.session.execute(
+            select(SensorReadingDaily)
+            .where(SensorReadingDaily.sensor_id == sensor_id)
+            .where(SensorReadingDaily.bucket_start == bucket_start)
+        )
+        return result.scalar_one_or_none()

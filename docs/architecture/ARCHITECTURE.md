@@ -271,7 +271,9 @@ State machine per alarm instance: `(no row) → ACTIVE → ACKNOWLEDGED / CLEARE
 
 ## 9. Historical Logging & Retention
 
-Raw `SensorReading` rows are kept for a configurable window (default 90 days), then a nightly worker rolls them into `SensorReadingHourly`/`SensorReadingDaily` aggregates and prunes the raw rows older than the window — keeping the History page's long-range charts fast and the SD card from filling up. `VACUUM`/WAL checkpoint runs as part of the same nightly job.
+Raw `SensorReading` rows are kept for a configurable window (default 90 days), then a nightly worker rolls them into `SensorReadingHourly`/`SensorReadingDaily` aggregates and prunes the raw rows older than the window — keeping the History page's long-range charts fast and the SD card from filling up.
+
+**Implementation note:** `RetentionWorker` (`backend/app/workers/retention.py`) buckets in Python (fetch the recent window, group by hour/day) rather than a dialect-specific SQL date-trunc, so it runs unchanged against SQLite or PostgreSQL; each bucket is checked for existence first (`get_bucket`) so re-running the job is harmless. Deliberately does **not** run `VACUUM` as part of the nightly job — it's a blocking, whole-database-locking operation that could stall the app for multiple seconds on a Pi with a large history; WAL mode already checkpoints automatically in the background (`app/core/database.py`'s PRAGMAs), and a full `VACUUM` is left as a manual/rare maintenance operation rather than an automated one.
 
 ---
 
@@ -295,8 +297,8 @@ Networking: standard Docker bridge network is sufficient — the poller only mak
 
 ## 12. Backup Strategy
 
-- **Local (always on):** nightly job uses SQLite's online backup API (`sqlite3 .backup`, not a raw file copy, so it's crash-consistent even against a live WAL) to a timestamped file under a `/backups` volume; rotation keeps the last 14 daily + 12 monthly snapshots.
-- **Remote (optional, best-effort):** an outbox pattern — `SensorReading`/`Alarm`/`SystemLog` carry a nullable `synced_at`. A background worker periodically probes internet reachability and, when available, batch-upserts unsynced rows to MongoDB Atlas, with backoff on failure. This worker is fully decoupled from the core write path — if it's stuck, disabled, or the internet is down for a month, ingestion/alarms/dashboard are unaffected; the backlog just grows until connectivity returns (with a log warning if the local backlog crosses a size threshold).
+- **Local (always on):** nightly job uses SQLite's online backup API (`sqlite3 .backup`, not a raw file copy, so it's crash-consistent even against a live WAL) to a timestamped file under a `/backups` volume; rotation keeps the last 14 daily snapshots, plus one representative per month for up to 12 months beyond that. Implemented in `backend/app/workers/backup.py` (`BackupWorker`), verified with real temp SQLite files (backup, restore, and multi-month rotation), not just mocked.
+- **Remote (optional, best-effort):** an outbox pattern — `SensorReading` carries a nullable `synced_at` (v1 syncs sensor history only, not `Alarm`/`SystemLog` — the highest-volume, most useful-for-offsite-analysis data, and the simplest case to get right; extending the same pattern to the other tables is a small, separate step if ever needed). `AtlasSyncWorker` (`backend/app/workers/atlas_sync.py`) runs every 60s by default, batch-upserting unsynced rows via `motor` (async MongoDB driver) and marking them synced only on success; any failure (no internet, unreachable Atlas, bad credentials) is logged and retried next cycle, never raised. Disabled by default (empty `ATLAS_CONNECTION_STRING`) — this worker is fully decoupled from the core write path, so if it's disabled or the internet is down for a month, ingestion/alarms/dashboard are entirely unaffected; the backlog just grows locally until connectivity returns.
 
 ---
 
@@ -342,7 +344,7 @@ JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`oper
 4. ✅ **REST API** — auth, live/history/alarms/sensors/settings/users/system endpoints.
 5. ✅ **WebSocket real-time layer**.
 6. ✅ **Frontend** — Dashboard, then History, Events, Settings, System pages.
-7. **Background workers** — retention/rollup, local backup, optional Atlas sync.
+7. ✅ **Background workers** — retention/rollup, local backup, optional Atlas sync.
 8. **Docker Compose deployment** + Raspberry Pi OS setup script.
 9. **Hardening pass** — resilience/error-handling review, recovery-after-power-failure drill, security review.
 
