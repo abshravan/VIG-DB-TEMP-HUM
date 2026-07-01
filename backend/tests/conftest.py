@@ -10,9 +10,11 @@ from app.models import *  # noqa: F401,F403 — ensure every model is registered
 
 
 @pytest_asyncio.fixture
-async def session() -> AsyncGenerator[AsyncSession, None]:
-    """Fresh in-memory SQLite DB per test, full schema created from the ORM models
-    (not a fixture file) so a schema drift between models and tests is impossible.
+async def session_maker() -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+    """Fresh in-memory SQLite DB per test, full schema created from the ORM models (not a
+    fixture file) so schema drift between models and tests is impossible. Yields a session
+    *factory* bound to that one engine — needed by anything (like the ingestion pipeline)
+    that opens more than one session against the same schema within a test.
     """
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
@@ -28,8 +30,13 @@ async def session() -> AsyncGenerator[AsyncSession, None]:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    session_maker = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    async with session_maker() as s:
-        yield s
+    yield async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
     await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session(session_maker: async_sessionmaker[AsyncSession]) -> AsyncGenerator[AsyncSession, None]:
+    """Single session for tests that only ever need one (the common case)."""
+    async with session_maker() as s:
+        yield s

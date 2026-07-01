@@ -174,12 +174,13 @@ Connection state machine: `DISCONNECTED → CONNECTING → CONNECTED → ERROR`.
 
 ## 5. Validation Layer
 
-Every raw read passes through, before it ever reaches the database:
-1. **Type/decode check** — malformed bytes → `BAD` quality, not a crash.
-2. **Range check** — physically implausible values (e.g., -50°C, 150% RH) → `BAD`, logged, not stored as truth (but the raw sample is kept in `SystemLog` for diagnosis).
-3. **Rate-of-change check** — a temperature jump of 40°C in one poll cycle is far more likely a sensor/wiring fault than reality → flagged, triggers `SENSOR_FAILURE` candidate.
-4. **Staleness check** — timestamp gap vs. expected poll interval → `STALE`.
-5. Only `GOOD` (and deliberately-flagged `STALE`) readings continue to the Alarm Engine and Repository layer; every reading, regardless of quality, is timestamped and quality-tagged in `SensorReading` so history isn't silently missing data — it explains *why* a gap or spike exists.
+Implemented in `backend/app/services/validation.py` (`ReadingValidator`). Every raw read is judged before it reaches the database:
+1. **Read failure (decode error, PLC rejected the request)** → no numeric value exists, so nothing is stored; it's counted toward a per-tag failure streak instead (see `SENSOR_FAILURE` below).
+2. **Range check** — a successfully-decoded analog value outside its tag's configured engineering span (plus a margin — default 20% — for legitimate excursions) → `BAD`.
+3. **Rate-of-change check** — a value moving more than a configurable fraction of its span (default 50%) in one poll cycle is far more likely a sensor/wiring fault than reality → `BAD`. A `BAD` reading does not update the "last known good" value used for the *next* cycle's rate check, so one implausible spike can't drag the baseline off course.
+4. **Digital tags** always pass straight through as `GOOD` (decoded true/false, no numeric range/rate applies).
+5. Every successfully-decoded reading — `GOOD` or `BAD` — is written to `SensorReading` with its quality tag, so history shows *why* a value looks off rather than leaving a silent gap. Only `GOOD` readings are fed to the Alarm Engine.
+6. **Staleness** is not written into stored rows (a freshly-written reading is never itself stale) — it's a live-status query (`ReadingValidator.is_stale`, comparing "now" against the last known-good timestamp), used by "live" views (Module 4/5) and by the `SENSOR_FAILURE`/`PLC_OFFLINE` alarms below.
 
 ---
 
@@ -254,12 +255,13 @@ All under `/api/v1`, JSON, JWT bearer auth (except `/auth/login`).
 
 ## 8. Alert System
 
-State machine per alarm instance: `NORMAL → ACTIVE → ACKNOWLEDGED → CLEARED` (an operator can acknowledge while still active; it auto-clears when the underlying condition returns within the hysteresis band for `min_duration_seconds`).
+State machine per alarm instance: `(no row) → ACTIVE → ACKNOWLEDGED / CLEARED` (an operator can acknowledge while still active; it clears the instant the underlying condition recovers past the hysteresis band — no separate clear-debounce). Implemented in `backend/app/services/alarm_engine.py` (`AlarmEngine`) — a single long-lived instance holds the in-memory per-rule debounce/open-alarm state across poll cycles; repositories are passed into its methods rather than owned by it, since a DB session is scoped per poll cycle, not per process.
 
-- **Hysteresis (deadband):** e.g. TEMP_HIGH trips at 30°C, clears only below 28°C — prevents rapid flapping around the exact threshold.
-- **Debounce:** condition must hold for `min_duration_seconds` before an alarm fires — prevents a single noisy sample from creating an alarm.
+- **Hysteresis (deadband):** e.g. TEMP_HIGH trips at 30°C, clears only below 28°C — prevents rapid flapping around the exact threshold. Threshold-style alarms (`TEMP_HIGH/LOW`, `HUMIDITY_HIGH/LOW`) use this; boolean-style alarms (`SMOKE`, `DOOR_OPEN`, `WATER_LEAK`, `PLC_OFFLINE`, `SENSOR_FAILURE`) have no deadband — they clear the instant the condition is false.
+- **Debounce:** condition must hold for `min_duration_seconds` before an alarm fires — prevents a single noisy sample from creating an alarm. Resets if the condition drops before the debounce window elapses.
 - **Severity:** INFO/WARNING/CRITICAL drives dashboard styling and (future) notification routing.
-- Covers all nine required types: Temp High/Low, Humidity High/Low, Smoke, Door Open, Water Leak, PLC Offline, Sensor Failure (the last driven by the Validation Layer's rate-of-change/range flags, not a raw threshold).
+- Covers all nine required types: Temp High/Low, Humidity High/Low, Smoke, Door Open, Water Leak, PLC Offline, Sensor Failure. `PLC_OFFLINE` is driven by `ResilientPLCConnection`'s state changes (via `ReadingIngestionService.handle_connection_state_change`); `SENSOR_FAILURE` is driven by a per-tag consecutive-read-failure streak (default threshold: 3) reaching its limit, via `ReadingIngestionService.handle_readings` — both call the same `AlarmEngine.evaluate` as the numeric threshold alarms, just with a 1.0/0.0 boolean condition instead of an engineering-unit value.
+- `ReadingIngestionService` (`backend/app/services/ingestion.py`) is the glue wired as the `PLCPoller`'s `on_readings` callback: validate → store `SensorReading` → evaluate alarm rules for that sensor, all inside one DB session per poll cycle.
 
 ---
 
@@ -330,9 +332,9 @@ JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`oper
 
 ## 17. Implementation Roadmap (module-by-module, each production-ready before the next)
 
-1. **Database layer** — SQLAlchemy models, Alembic migrations, repositories, seed data.
-2. **PLC communication layer** — `PLCClient` interface + S7 implementation (default) + Modbus implementation, tag map loader, tiered poller, connection resilience — tested against a simulator before real PLC access is available.
-3. **Validation layer + Alarm engine** — quality flags, rule evaluation, state machine.
+1. ✅ **Database layer** — SQLAlchemy models, Alembic migrations, repositories, seed data.
+2. ✅ **PLC communication layer** — `PLCClient` interface + S7 implementation (default) + Modbus implementation, tag map loader, tiered poller, connection resilience — tested against a simulator before real PLC access is available.
+3. ✅ **Validation layer + Alarm engine** — quality flags, rule evaluation, state machine.
 4. **REST API** — auth, live/history/alarms/sensors/settings/users/system endpoints.
 5. **WebSocket real-time layer**.
 6. **Frontend** — Dashboard, then History, Events, Settings, System pages.
