@@ -1,0 +1,88 @@
+# PLC tag map — handed to us by the PLC team, consumed by app/plc/tags.py without any code
+# changes. Both `s7` and `modbus` addresses are given for every tag so switching PLC_PROTOCOL
+# is a config change only (see ARCHITECTURE.md §3.1, §4.1-4.2).
+#
+# These example addresses assume a single non-optimized DB (DB10) on the S7-1200 exposing all
+# process values, and a matching MB_SERVER register/coil map on the Modbus side. Replace with
+# the PLC team's actual layout once confirmed; sensor `name` values must match the `tag_name`
+# seeded in database/seed/seed.py.
+
+poll_intervals:
+  fast: 1.0 # smoke, water leak, door — safety-relevant digital signals
+  normal: 5.0 # temperature, humidity — analog process values
+
+tags:
+  - name: temp_rack_a
+    kind: analog
+    sensor_type: TEMPERATURE
+    poll_tier: normal
+    s7:
+      db: 10
+      offset: 0
+      type: REAL
+    modbus:
+      register_address: 0
+      type: FLOAT32
+    scale:
+      raw_min: 0
+      raw_max: 27648
+      eng_min: 0
+      eng_max: 50
+      unit: "°C"
+
+  - name: humidity_room
+    kind: analog
+    sensor_type: HUMIDITY
+    poll_tier: normal
+    s7:
+      db: 10
+      offset: 4
+      type: REAL
+    modbus:
+      register_address: 2
+      type: FLOAT32
+    scale:
+      raw_min: 0
+      raw_max: 27648
+      eng_min: 0
+      eng_max: 100
+      unit: "%RH"
+
+  - name: smoke_main
+    kind: digital
+    sensor_type: SMOKE
+    poll_tier: fast
+    s7:
+      db: 10
+      offset: 8
+      type: BOOL
+      bit: 0
+    modbus:
+      register_address: 0
+      type: COIL
+
+  - name: water_leak_floor
+    kind: digital
+    sensor_type: WATER_LEAK
+    poll_tier: fast
+    s7:
+      db: 10
+      offset: 8
+      type: BOOL
+      bit: 1
+    modbus:
+      register_address: 1
+      type: COIL
+
+  - name: door_main
+    kind: digital
+    sensor_type: DOOR
+    poll_tier: fast
+    s7:
+      db: 10
+      offset: 8
+      type: BOOL
+      bit: 2
+    modbus:
+      register_address: 2
+      type: COIL
