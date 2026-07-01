@@ -341,7 +341,7 @@ JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`oper
 3. ✅ **Validation layer + Alarm engine** — quality flags, rule evaluation, state machine.
 4. ✅ **REST API** — auth, live/history/alarms/sensors/settings/users/system endpoints.
 5. ✅ **WebSocket real-time layer**.
-6. **Frontend** — Dashboard, then History, Events, Settings, System pages.
+6. ✅ **Frontend** — Dashboard, then History, Events, Settings, System pages.
 7. **Background workers** — retention/rollup, local backup, optional Atlas sync.
 8. **Docker Compose deployment** + Raspberry Pi OS setup script.
 9. **Hardening pass** — resilience/error-handling review, recovery-after-power-failure drill, security review.
