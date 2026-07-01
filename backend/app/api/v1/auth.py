@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser
 from app.core.database import get_db
+from app.core.rate_limit import SlidingWindowRateLimiter
 from app.core.security import create_access_token, create_refresh_token, decode_token, verify_password
 from app.core.time import utcnow
 from app.repositories import UserRepository
@@ -11,6 +12,10 @@ from app.schemas.auth import LoginRequest, RefreshRequest, TokenResponse
 from app.schemas.user import UserOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+#: Keyed by lowercased username — a persistent brute-force attempt against one account is
+#: throttled regardless of which IP it comes from. Process-lifetime only (ARCHITECTURE.md §15).
+_login_rate_limiter = SlidingWindowRateLimiter(max_attempts=5, window_seconds=300)
 
 
 def _tokens_for(user) -> TokenResponse:
@@ -22,9 +27,17 @@ def _tokens_for(user) -> TokenResponse:
 
 @router.post("/login", response_model=TokenResponse)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> TokenResponse:
+    rate_limit_key = payload.username.lower()
+    if not _login_rate_limiter.is_allowed(rate_limit_key):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Try again later.",
+        )
+
     user_repo = UserRepository(db)
     user = await user_repo.get_by_username(payload.username)
     if user is None or not user.is_active or not verify_password(payload.password, user.hashed_password):
+        _login_rate_limiter.record_attempt(rate_limit_key)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password")
     user.last_login_at = utcnow()
     return _tokens_for(user)

@@ -19,7 +19,10 @@ class ConnectionManager:
         self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket) -> None:
-        await websocket.accept()
+        """Registers an already-accepted connection. Accepting is the caller's
+        responsibility (not done here) because `/ws/live` must accept the socket *before* it
+        can read the client's first-message auth token — see `app/realtime/router.py`.
+        """
         async with self._lock:
             self._connections.add(websocket)
 

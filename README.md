@@ -19,4 +19,4 @@ Production monitoring system for a basement server room: Siemens S7-1200 PLC →
 
 ## Status
 
-Architecture designed and committed. Implementation proceeds one module at a time per the roadmap in the architecture doc — nothing here is production code yet.
+All 9 modules of the implementation roadmap are complete (database layer, PLC communication, validation + alarm engine, REST API, WebSocket real-time layer, frontend dashboard, background workers, Docker Compose deployment, and a hardening pass covering crash-recovery, rate limiting, structured logging, and a WebSocket auth redesign). See [`docs/architecture/ARCHITECTURE.md` §17](docs/architecture/ARCHITECTURE.md#17-implementation-roadmap-module-by-module-each-production-ready-before-the-next) for what each module covers and how it was verified.

@@ -253,7 +253,7 @@ All under `/api/v1`, JSON, JWT bearer auth (except `/auth/login`).
 **WebSocket**
 - `WS /ws/live` — pushes `{"type": "reading"|"alarm"|"plc_status"|"system_health", "data": {...}}` frames; the same envelope shape the frontend store consumes for all four dashboard live-update needs.
 
-**Implementation note:** `ConnectionManager` (`backend/app/realtime/connection_manager.py`) is the in-process pub/sub broadcaster from §3.4 — created once in `create_app()` (not inside the PLC lifespan) so `/ws/live` works independently of whether the PLC poller is running. Browsers can't set a custom `Authorization` header on a WebSocket handshake, so auth is `?token=<jwt access token>` as a query parameter, validated the same way as REST (`decode_token` + an active-user check) before `accept()`. `ReadingIngestionService` broadcasts a `reading` frame after every stored poll cycle and an `alarm` frame whenever `AlarmEngine.evaluate()` reports a state change (it now returns the changed `Alarm` or `None` for exactly this); `plc_status` is broadcast on every `ResilientPLCConnection` state change; `system_health` is pushed every 10s by a small background task (`app/realtime/health_broadcaster.py`), skipped entirely when no client is connected. Verified against a real `uvicorn` process and a real `websockets` client (not just the test suite) — connect, then receive a live `system_health` frame over the wire.
+**Implementation note:** `ConnectionManager` (`backend/app/realtime/connection_manager.py`) is the in-process pub/sub broadcaster from §3.4 — created once in `create_app()` (not inside the PLC lifespan) so `/ws/live` works independently of whether the PLC poller is running. Browsers can't set a custom `Authorization` header on a WebSocket handshake, so the server always `accept()`s the socket first and then reads a JSON `{"token": "<jwt access token>"}` first-message as an auth handshake (`app/realtime/router.py`), validated the same way as REST (`decode_token` + an active-user check); an invalid/missing/expired token, or no message within a 5s timeout, closes with `WS_1008_POLICY_VIOLATION`. This replaced an earlier `?token=` query-string design (Module 9 hardening pass): a token in the URL ends up verbatim in proxy/nginx access logs and browser history, which a first-message handshake avoids. `ReadingIngestionService` broadcasts a `reading` frame after every stored poll cycle and an `alarm` frame whenever `AlarmEngine.evaluate()` reports a state change (it now returns the changed `Alarm` or `None` for exactly this); `plc_status` is broadcast on every `ResilientPLCConnection` state change; `system_health` is pushed every 10s by a small background task (`app/realtime/health_broadcaster.py`), skipped entirely when no client is connected. Verified against a real `uvicorn` process and a real browser (Playwright) — connect, send the token frame, then receive live frames over the wire, with no token ever appearing in the WebSocket URL.
 
 ---
 
@@ -311,6 +311,8 @@ Networking: standard Docker bridge network is sufficient — the poller only mak
 - Frontend: WebSocket client auto-reconnects with backoff and shows a "Reconnecting…" banner instead of silently going stale.
 - Docker healthchecks restart a container that's stopped producing fresh data, without operator intervention.
 
+**Implementation note (Module 9):** `app/core/logging_config.py`'s `configure_logging()` replaces the root logger's handlers with a `JsonFormatter` emitting one JSON object per line (`timestamp`, `level`, `logger`, `message`, and `exception` when present) — machine-parseable for `docker logs` / log shipping, instead of the default plain-text format.
+
 ---
 
 ## 14. Recovery After Power Failure
@@ -320,11 +322,19 @@ Networking: standard Docker bridge network is sufficient — the poller only mak
 - Startup logs a `SYSTEM_RESTART` `SystemLog` entry; a `clean_shutdown` marker file (removed at startup, rewritten by a graceful-shutdown handler) lets us tell a clean restart apart from a crash/power-loss in that log entry.
 - Hardware recommendation (not software-enforced): a small UPS/PoE with battery buys time for graceful shutdown and protects the SD card from a write-in-progress power cut.
 
+**Implementation note (Module 9):** built in `app/services/startup.py`. `record_startup()` runs at the top of the FastAPI `lifespan`, before the PLC poller starts: it checks for a `.clean_shutdown` marker file next to the SQLite DB, logs a `SystemLog` row (`INFO` "Clean restart" if the marker was present, `WARNING` "Restart after unclean shutdown (crash or power loss)" if not), then removes the marker so the *next* boot starts from a clean slate. `mark_clean_shutdown()` re-creates the marker in the `lifespan`'s `finally` block, so it only exists if the previous run shut down gracefully (SIGTERM, not a power cut). Verified with a real `uvicorn` boot → `SIGTERM` → reboot cycle, reading back the actual `SystemLog` rows for both the clean and unclean paths.
+
 ---
 
 ## 15. Security
 
 JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`operator`/`viewer`), login rate-limiting, JWT secret from `.env` only (never committed). HTTPS via an internal/self-signed cert is recommended even on LAN, since credentials still traverse the network in plaintext otherwise.
+
+**Implementation notes (Module 9):**
+- Login rate limiting: `app/core/rate_limit.py`'s `SlidingWindowRateLimiter` (in-memory, no external store needed for a single-process LAN app) caps `/api/v1/auth/login` at 5 attempts per username per 5-minute window, returning `429` once exceeded; only failed attempts count against the window, so a legitimate user isn't locked out by their own successful login.
+- `app/main.py`'s `_warn_if_insecure_for_production()` logs a `CRITICAL` line at startup if `ENVIRONMENT=production` and `JWT_SECRET_KEY` is still the repo's placeholder value — a cheap guard against shipping the default secret.
+- `/ws/live` auth is a first-message JSON handshake, not a `?token=` query parameter — see §7's implementation note for why.
+- Sensor `tag_name`/`display_name`/`location`/`unit` fields are pattern- and length-constrained in `app/schemas/sensor.py` (`tag_name` restricted to `[A-Za-z0-9_]+`) after a review found an unescaped `tag_name` could inject characters into the `Content-Disposition` header of the CSV export endpoint.
 
 ---
 
@@ -348,6 +358,6 @@ JWT access + refresh tokens, bcrypt/argon2 password hashing, RBAC (`admin`/`oper
 6. ✅ **Frontend** — Dashboard, then History, Events, Settings, System pages.
 7. ✅ **Background workers** — retention/rollup, local backup, optional Atlas sync.
 8. ✅ **Docker Compose deployment** + Raspberry Pi OS setup script.
-9. **Hardening pass** — resilience/error-handling review, recovery-after-power-failure drill, security review.
+9. ✅ **Hardening pass** — clean-shutdown/restart detection (real reboot-cycle drill), login rate limiting, structured JSON logging, production-JWT-secret safety check, CSV-export header-injection fix, and a WebSocket-auth redesign (query-param token → first-message handshake) after a real end-to-end browser check flagged the token leaking into the connection URL.
 
 This order is deliberate: the database and PLC layers are the foundation everything else reads from, so they're built and proven first; the frontend comes after the API contract is stable so it isn't built against a moving target.

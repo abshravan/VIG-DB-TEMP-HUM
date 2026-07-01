@@ -25,13 +25,15 @@ class FakeWebSocket:
         self.sent.append(message)
 
 
-async def test_connect_accepts_and_registers():
+async def test_connect_registers_an_already_accepted_connection():
+    # accept() is the caller's responsibility (it must happen before the auth handshake in
+    # /ws/live), not ConnectionManager's — see connection_manager.py's connect() docstring.
     manager = ConnectionManager()
     ws = FakeWebSocket()
+    await ws.accept()
 
     await manager.connect(ws)
 
-    assert ws.accepted is True
     assert manager.connection_count == 1
 
 

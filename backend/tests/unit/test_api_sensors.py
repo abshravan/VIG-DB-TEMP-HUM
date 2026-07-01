@@ -70,6 +70,21 @@ async def test_create_sensor_rejects_duplicate_tag_name(api_client, session_make
     assert response.status_code == 409
 
 
+async def test_create_sensor_rejects_tag_name_with_unsafe_characters(api_client, session_maker):
+    # tag_name flows unescaped into the CSV export's Content-Disposition header — quotes,
+    # CR/LF, and path separators must be rejected at the input boundary (ARCHITECTURE.md §15).
+    await create_user(session_maker, "admin", "pw12345678", UserRole.ADMIN)
+    headers = await login_headers(api_client, "admin", "pw12345678")
+
+    for bad_tag_name in ['bad"name', "bad\r\nname", "bad/name", "bad name"]:
+        response = await api_client.post(
+            "/api/v1/sensors",
+            json={"tag_name": bad_tag_name, "display_name": "Bad", "sensor_type": "TEMPERATURE"},
+            headers=headers,
+        )
+        assert response.status_code == 422, f"expected rejection for {bad_tag_name!r}"
+
+
 async def test_operator_can_update_sensor_display_name(api_client, session_maker):
     await _seed_sensor(session_maker)
     await create_user(session_maker, "op", "pw12345678", UserRole.OPERATOR)

@@ -8,12 +8,18 @@ side of the connection stays open (confirmed empirically: even a bare connect-th
 indefinitely). Plain sync tests avoid the nested-loop hazard entirely; async setup/broadcast
 calls use `asyncio.run(...)`, each a self-contained event loop that starts and fully tears
 down before the next line runs.
+
+Auth is a first-message handshake (send `{"token": "..."}` right after connecting), not a
+`?token=` query param — see app/realtime/router.py's docstring for why. The transport-level
+`websocket_connect()` call itself always succeeds now (the server always accepts before
+authenticating); rejection shows up as a `WebSocketDisconnect` on the next send/receive.
 """
 
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.websockets import WebSocketDisconnect
 
 from app.core.database import get_db
 from app.core.security import create_access_token, create_refresh_token
@@ -40,17 +46,33 @@ def _dispose(engine) -> None:
     asyncio.run(engine.dispose())
 
 
-def test_ws_rejects_connection_without_token():
+def _wait_for_connection_count(manager, expected: int) -> None:
+    """Auth happens asynchronously on the server (in the TestClient's own portal thread), so
+    `manager.connection_count` doesn't update the instant `send_json` returns — poll briefly
+    rather than assuming synchrony.
+    """
+    for _ in range(50):
+        if manager.connection_count == expected:
+            return
+        asyncio.run(asyncio.sleep(0.02))
+    raise AssertionError(f"connection_count never reached {expected}, was {manager.connection_count}")
+
+
+def _assert_rejected(client: TestClient, send: callable) -> None:
+    """Connects, lets `send` push whatever first message the test wants, then confirms the
+    server closed the connection (surfaced as WebSocketDisconnect) rather than accepting it.
+    """
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws/live") as websocket:
+            send(websocket)
+            websocket.receive_text()
+
+
+def test_ws_rejects_first_message_with_no_token_field():
     app, _session_maker, engine = _new_app_with_db()
     client = TestClient(app)
     try:
-        raised = False
-        try:
-            with client.websocket_connect("/ws/live"):
-                pass
-        except Exception:
-            raised = True
-        assert raised
+        _assert_rejected(client, lambda ws: ws.send_json({}))
     finally:
         _dispose(engine)
 
@@ -59,13 +81,7 @@ def test_ws_rejects_invalid_token():
     app, _session_maker, engine = _new_app_with_db()
     client = TestClient(app)
     try:
-        raised = False
-        try:
-            with client.websocket_connect("/ws/live?token=not-a-real-token"):
-                pass
-        except Exception:
-            raised = True
-        assert raised
+        _assert_rejected(client, lambda ws: ws.send_json({"token": "not-a-real-token"}))
     finally:
         _dispose(engine)
 
@@ -76,13 +92,7 @@ def test_ws_rejects_refresh_token_used_as_access_token():
         asyncio.run(create_user(session_maker, "viewer", "pw12345678", UserRole.VIEWER))
         refresh_token = create_refresh_token("viewer", "VIEWER")
         client = TestClient(app)
-        raised = False
-        try:
-            with client.websocket_connect(f"/ws/live?token={refresh_token}"):
-                pass
-        except Exception:
-            raised = True
-        assert raised
+        _assert_rejected(client, lambda ws: ws.send_json({"token": refresh_token}))
     finally:
         _dispose(engine)
 
@@ -92,13 +102,7 @@ def test_ws_rejects_unknown_user():
     try:
         token = create_access_token("nobody", "VIEWER")
         client = TestClient(app)
-        raised = False
-        try:
-            with client.websocket_connect(f"/ws/live?token={token}"):
-                pass
-        except Exception:
-            raised = True
-        assert raised
+        _assert_rejected(client, lambda ws: ws.send_json({"token": token}))
     finally:
         _dispose(engine)
 
@@ -118,13 +122,7 @@ def test_ws_rejects_inactive_user():
 
         token = create_access_token("disabled", "VIEWER")
         client = TestClient(app)
-        raised = False
-        try:
-            with client.websocket_connect(f"/ws/live?token={token}"):
-                pass
-        except Exception:
-            raised = True
-        assert raised
+        _assert_rejected(client, lambda ws: ws.send_json({"token": token}))
     finally:
         _dispose(engine)
 
@@ -136,9 +134,10 @@ def test_ws_accepts_valid_token_and_receives_broadcast():
         token = create_access_token("viewer", "VIEWER")
         client = TestClient(app)
 
-        with client.websocket_connect(f"/ws/live?token={token}") as websocket:
+        with client.websocket_connect("/ws/live") as websocket:
+            websocket.send_json({"token": token})
             manager = app.state.connection_manager
-            assert manager.connection_count == 1
+            _wait_for_connection_count(manager, 1)
             asyncio.run(manager.broadcast({"type": "reading", "data": {"sensor_id": 1, "value": 22.5}}))
             message = websocket.receive_json()
             assert message == {"type": "reading", "data": {"sensor_id": 1, "value": 22.5}}
@@ -154,8 +153,9 @@ def test_ws_disconnect_removes_connection_from_manager():
         client = TestClient(app)
         manager = app.state.connection_manager
 
-        with client.websocket_connect(f"/ws/live?token={token}"):
-            assert manager.connection_count == 1
+        with client.websocket_connect("/ws/live") as websocket:
+            websocket.send_json({"token": token})
+            _wait_for_connection_count(manager, 1)
 
         assert manager.connection_count == 0
     finally:

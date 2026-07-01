@@ -9,8 +9,9 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.v1.router import api_router
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.database import async_session_maker
+from app.core.logging_config import configure_logging
 from app.core.time import utcnow
 from app.plc.base import ConnectionState
 from app.plc.connection import ResilientPLCConnection
@@ -22,14 +23,25 @@ from app.realtime.health_broadcaster import run_periodic_health_broadcast
 from app.realtime.router import router as realtime_router
 from app.services.alarm_engine import AlarmEngine
 from app.services.ingestion import ReadingIngestionService
+from app.services.startup import mark_clean_shutdown, record_startup
 from app.services.validation import ReadingValidator
 from app.workers.atlas_sync import AtlasSyncWorker, run_periodic_atlas_sync
 from app.workers.backup import BackupWorker
 from app.workers.retention import RetentionWorker
 from app.workers.scheduler import parse_hhmm, run_daily
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
+
+DEV_ONLY_JWT_SECRET = "dev-only-insecure-secret-change-me"
+
+
+def _warn_if_insecure_for_production(settings: Settings) -> None:
+    if settings.environment == "production" and settings.jwt_secret_key == DEV_ONLY_JWT_SECRET:
+        logger.critical(
+            "JWT_SECRET_KEY is still the development placeholder in a production environment — "
+            "set a real random secret (see docker/.env.example)."
+        )
 
 
 async def _cancel(task: asyncio.Task) -> None:
@@ -50,6 +62,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     `/ws/live` works even in tests that don't enter this lifespan.
     """
     settings = get_settings()
+    _warn_if_insecure_for_production(settings)
+    await record_startup(async_session_maker, settings)
+
     tag_map = load_tag_map(settings.tag_map_path)
     client = build_plc_client(settings)
     validator = ReadingValidator()
@@ -98,6 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await _cancel(task)
         await poller.stop()
         await client.disconnect()
+        mark_clean_shutdown(settings)
         logger.info("PLC poller and background workers stopped")
 
 

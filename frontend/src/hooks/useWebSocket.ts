@@ -30,10 +30,13 @@ export function useWebSocket(): WsConnectionStatus {
     function connect() {
       setStatus(attemptRef.current === 0 ? "connecting" : "reconnecting");
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const socket = new WebSocket(`${protocol}//${window.location.host}/ws/live?token=${accessToken}`);
+      // Auth is a first-message handshake, not a `?token=` query param — a query-string
+      // token would end up verbatim in nginx/proxy access logs and browser history.
+      const socket = new WebSocket(`${protocol}//${window.location.host}/ws/live`);
       socketRef.current = socket;
 
       socket.onopen = () => {
+        socket.send(JSON.stringify({ token: accessToken }));
         attemptRef.current = 0;
         setStatus("open");
       };
